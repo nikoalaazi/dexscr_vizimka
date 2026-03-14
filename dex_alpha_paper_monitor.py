@@ -4,11 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL.*")
+warnings.filterwarnings("ignore", module=r"urllib3.*")
+
 import requests
+from dotenv import dotenv_values
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -19,6 +24,7 @@ DEX_TOKEN_BOOSTS = "https://api.dexscreener.com/token-boosts/latest/v1"
 DEX_TOKEN_BOOSTS_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_TOKEN_PAIRS = "https://api.dexscreener.com/latest/dex/tokens/{token}"
 DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search?q={q}"
+NANSEN_TOKEN_SCREENER = "https://api.nansen.ai/api/v1/token-screener"
 
 ALLOWED_CHAINS = {"base", "ethereum"}
 EXCLUDED_SYMBOLS = {
@@ -42,6 +48,7 @@ class Candidate:
     sells_24h: int
     twitter: str | None
     score: float
+    fail_reasons: list[str]
 
 
 def _num(v: Any) -> float:
@@ -51,8 +58,28 @@ def _num(v: Any) -> float:
         return 0.0
 
 
+def reason_priority(reason: str) -> int:
+    # lower is more critical
+    order = {
+        "liquidity": 1,
+        "volume": 2,
+        "mcap": 3,
+    }
+    return order.get(reason, 99)
+
+
+def risk_label(c: Candidate, strict: bool) -> str:
+    if not strict:
+        return "🟠 near-miss"
+    if c.liquidity_usd < 100_000:
+        return "🟠 повышенный"
+    if c.txns_24h < 80:
+        return "🟠 повышенный"
+    return "🟢 норм"
+
+
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="DexScreener alpha scout (Base+ETH) with paper trades")
+    ap = argparse.ArgumentParser(description="DexScreener alpha scout v2 (Base+ETH) with paper trades")
     ap.add_argument("--capital-usd", type=float, default=1000.0)
     ap.add_argument("--ticket-share", type=float, default=0.1, help="paper position size = capital * share")
     ap.add_argument("--min-liquidity", type=float, default=50_000)
@@ -60,11 +87,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--min-mcap", type=float, default=200_000)
     ap.add_argument("--max-mcap", type=float, default=10_000_000)
     ap.add_argument("--top", type=int, default=8)
+    ap.add_argument("--top-per-chain", type=int, default=3)
     ap.add_argument("--entry-score", type=float, default=7.0)
     ap.add_argument("--tp", type=float, default=0.4, help="take profit in fraction")
     ap.add_argument("--sl", type=float, default=0.2, help="stop loss in fraction")
     ap.add_argument("--max-hold-hours", type=int, default=48)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--watchlist", default="AERO,DEGEN,BRETT,TOSHI,VIRTUAL,MORPHO,JUNO,DIEM")
+    ap.add_argument("--nansen-per-page", type=int, default=80)
     return ap.parse_args()
 
 
@@ -118,6 +148,50 @@ def fetch_search_pairs(query: str) -> list[dict]:
     return data.get("pairs", []) if isinstance(data, dict) else []
 
 
+def _get_nansen_key() -> str | None:
+    env = dotenv_values(str(WORKSPACE / ".env"))
+    return env.get("NANSEN_API_KEY")
+
+
+def fetch_nansen_candidates(min_liquidity: float, max_mcap: float, per_page: int = 80) -> list[dict]:
+    key = _get_nansen_key()
+    if not key:
+        return []
+    out: list[dict] = []
+    headers = {"Content-Type": "application/json", "apikey": key}
+    for chain in ("base", "ethereum"):
+        body = {
+            "chains": [chain],
+            "timeframe": "24h",
+            "pagination": {"page": 1, "per_page": per_page},
+            "filters": {"liquidity": {"min": min_liquidity}},
+            "order_by": [{"field": "netflow", "direction": "DESC"}],
+        }
+        try:
+            r = requests.post(NANSEN_TOKEN_SCREENER, json=body, headers=headers, timeout=30)
+            r.raise_for_status()
+            data = r.json().get("data", [])
+        except Exception:
+            data = []
+
+        for it in data:
+            sym = str(it.get("token_symbol") or "").upper().strip()
+            addr = str(it.get("token_address") or "")
+            mcap = _num(it.get("market_cap_usd"))
+            liq = _num(it.get("liquidity"))
+            traders = int(_num(it.get("nof_traders")))
+            if not sym or not addr:
+                continue
+            if sym in EXCLUDED_SYMBOLS or any(x in sym for x in ("USD", "WETH", "WBTC", "STETH", "BTCB")):
+                continue
+            if not (200_000 <= mcap <= max_mcap):
+                continue
+            if liq < min_liquidity or traders <= 0:
+                continue
+            out.append({"chain": chain, "symbol": sym, "tokenAddress": addr, "traders": traders})
+    return out
+
+
 def score_pair(p: dict) -> float:
     liq = _num((p.get("liquidity") or {}).get("usd"))
     vol = _num((p.get("volume") or {}).get("h24"))
@@ -143,9 +217,10 @@ def score_pair(p: dict) -> float:
     return score
 
 
-def build_candidates(args: argparse.Namespace) -> list[Candidate]:
+def build_candidates(args: argparse.Namespace) -> tuple[list[Candidate], dict[str, list[Candidate]]]:
     profiles = fetch_profiles()
     boosts = fetch_boosts()
+    nansen = fetch_nansen_candidates(args.min_liquidity, args.max_mcap, args.nansen_per_page)
     out: list[Candidate] = []
 
     twitter_by_token: dict[str, str] = {}
@@ -160,7 +235,9 @@ def build_candidates(args: argparse.Namespace) -> list[Candidate]:
                     break
 
     pair_pool: list[dict] = []
-    for q in ("base", "ethereum"):
+    watch_syms = [x.strip().upper() for x in str(args.watchlist).split(",") if x.strip()]
+    query_seeds = ["base", "ethereum", *watch_syms]
+    for q in query_seeds:
         try:
             pair_pool.extend(fetch_search_pairs(q))
         except Exception:
@@ -184,6 +261,19 @@ def build_candidates(args: argparse.Namespace) -> list[Candidate]:
         except Exception:
             continue
 
+    # Stronger source: seed from Nansen top smart-money flow (Base + ETH).
+    for it in nansen:
+        token = str(it.get("tokenAddress") or "")
+        if not token or token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        try:
+            pair_pool.extend(fetch_pairs(token)[:8])
+        except Exception:
+            continue
+
+    nansen_traders_by_token = {str(x.get("tokenAddress") or "").lower(): int(x.get("traders") or 0) for x in nansen}
+
     best_by_symbol: dict[str, Candidate] = {}
     for p in pair_pool:
         chain = (p.get("chainId") or "").lower()
@@ -201,15 +291,37 @@ def build_candidates(args: argparse.Namespace) -> list[Candidate]:
         mcap = _num(p.get("marketCap")) or _num(p.get("fdv"))
         liq = _num((p.get("liquidity") or {}).get("usd"))
         vol24 = _num((p.get("volume") or {}).get("h24"))
+
+        fail_reasons: list[str] = []
         if not (args.min_mcap <= mcap <= args.max_mcap):
-            continue
-        if liq < args.min_liquidity or vol24 < args.min_volume_24h:
-            continue
+            fail_reasons.append("mcap")
+        if liq < args.min_liquidity:
+            fail_reasons.append("liquidity")
+        if vol24 < args.min_volume_24h:
+            fail_reasons.append("volume")
 
         tx24 = (p.get("txns") or {}).get("h24") or {}
         sc = score_pair(p)
         tw = twitter_by_token.get(token_addr.lower())
+        if not tw:
+            info = p.get("info") or {}
+            socials = info.get("socials") or []
+            for s in socials:
+                if isinstance(s, dict) and (s.get("type") == "twitter" or "twitter.com" in str(s.get("url", ""))):
+                    tw = str(s.get("url") or "")
+                    break
+            if not tw:
+                for s in (info.get("websites") or []):
+                    if isinstance(s, dict) and "twitter.com" in str(s.get("url", "")):
+                        tw = str(s.get("url") or "")
+                        break
+
         if tw:
+            sc += 1.0
+        n_traders = int(nansen_traders_by_token.get(token_addr.lower(), 0))
+        if n_traders >= 10:
+            sc += 1.0
+        if n_traders >= 50:
             sc += 1.0
 
         c = Candidate(
@@ -227,15 +339,28 @@ def build_candidates(args: argparse.Namespace) -> list[Candidate]:
             sells_24h=int(_num(tx24.get("sells"))),
             twitter=tw,
             score=sc,
+            fail_reasons=fail_reasons,
         )
 
         old = best_by_symbol.get(symbol)
         if old is None or (c.score, c.volume_24h, c.liquidity_usd) > (old.score, old.volume_24h, old.liquidity_usd):
             best_by_symbol[symbol] = c
 
-    out = list(best_by_symbol.values())
-    out.sort(key=lambda c: (c.score, c.volume_24h, c.liquidity_usd), reverse=True)
-    return out[: args.top]
+    all_cands = list(best_by_symbol.values())
+    all_cands.sort(key=lambda c: (c.score, c.volume_24h, c.liquidity_usd), reverse=True)
+
+    # top-N per chain strict + near-miss fillers (failed exactly one criterion)
+    picked: list[Candidate] = []
+    near_by_chain: dict[str, list[Candidate]] = {"base": [], "ethereum": []}
+    for chain in ("base", "ethereum"):
+        chain_cands = [c for c in all_cands if c.chain == chain]
+        strict = [c for c in chain_cands if not c.fail_reasons]
+        near = [c for c in chain_cands if len(c.fail_reasons) == 1]
+        picked.extend(strict[: args.top_per_chain])
+        near_by_chain[chain] = near
+
+    picked.sort(key=lambda c: (c.chain, -c.score, -c.volume_24h, -c.liquidity_usd))
+    return picked[: max(args.top, args.top_per_chain * 2)], near_by_chain
 
 
 def apply_paper_trades(args: argparse.Namespace, st: dict, cands: list[Candidate]) -> list[dict]:
@@ -307,7 +432,7 @@ def main() -> int:
     st = load_state()
 
     try:
-        cands = build_candidates(args)
+        cands, near_by_chain = build_candidates(args)
     except Exception as e:
         print("Сделано:")
         print("- Dex alpha scan (Base+ETH) не завершён.")
@@ -330,17 +455,41 @@ def main() -> int:
     lines.append(f"- Кандидатов после фильтров: {len(cands)}")
     lines.append(f"- Режим: paper trades (ticket ${args.capital_usd * args.ticket_share:.2f})")
     lines.append("")
-    lines.append("Топ-кандидаты:")
+    lines.append("Топ-кандидаты (top-3 per chain):")
     if cands:
-        for i, c in enumerate(cands, 1):
-            lines.append(
-                f"{i}) {c.symbol} ({c.chain}) — score {c.score:.1f}, mcap ${c.mcap:,.0f}, liq ${c.liquidity_usd:,.0f}, vol24h ${c.volume_24h:,.0f}, smart proxy tx {c.txns_24h}, twitter {'yes' if c.twitter else 'no'}"
-            )
+        for chain in ("base", "ethereum"):
+            chain_cands = [c for c in cands if c.chain == chain]
+            lines.append(f"- {chain.upper()}:")
+            shown = 0
+            for i, c in enumerate(chain_cands[: args.top_per_chain], 1):
+                shown += 1
+                lines.append(
+                    f"  {i}) {c.symbol} — {risk_label(c, strict=True)}, score {c.score:.1f}, mcap ${c.mcap:,.0f}, liq ${c.liquidity_usd:,.0f}, vol24h ${c.volume_24h:,.0f}, smart proxy tx {c.txns_24h}, twitter: {'найден' if c.twitter else 'не найден'}"
+                )
+
+            if shown < args.top_per_chain:
+                fillers = near_by_chain.get(chain, [])
+                fillers = sorted(
+                    fillers,
+                    key=lambda x: (reason_priority(x.fail_reasons[0] if x.fail_reasons else "unknown"), -x.score, -x.volume_24h),
+                )
+                idx = shown + 1
+                for f in fillers[: max(0, args.top_per_chain - shown)]:
+                    reason = f.fail_reasons[0] if f.fail_reasons else "unknown"
+                    lines.append(
+                        f"  {idx}) {f.symbol} — 🟠 near-miss ({reason}), score {f.score:.1f}, mcap ${f.mcap:,.0f}, liq ${f.liquidity_usd:,.0f}, vol24h ${f.volume_24h:,.0f}, twitter: {'найден' if f.twitter else 'не найден'}"
+                    )
+                    idx += 1
+
+                while idx <= args.top_per_chain:
+                    lines.append(f"  {idx}) Нет данных (рынок узкий под фильтры)")
+                    idx += 1
     else:
         lines.append("1) Нет данных")
 
     lines.append("")
     lines.append("Риски:")
+    lines.append("- Легенда: 🟢 норм / 🟠 повышенный / 🟠 near-miss (рядом с фильтром, не вход).")
     lines.append("- Ранняя стадия (200k–500k mcap) = высокий риск манипуляций/illiquidity.")
     lines.append("- Social score здесь базовый (наличие Twitter), не quality-influencer граф.")
 

@@ -1,6 +1,6 @@
 # dexscr_vizimka
 
-Version: **0.1**
+Version: **0.2**
 
 DexScreener-based alpha monitor for Base + Ethereum in paper-trades mode.
 
